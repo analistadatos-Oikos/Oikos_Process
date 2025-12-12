@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Credenciales (por seguridad)
+*.credentials
+*.secret
+config.ini
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
