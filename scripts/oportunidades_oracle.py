@@ -1,10 +1,9 @@
 # ============================================================================
-# 🔄 SINCRONIZACIÓN OPORTUNIDADES - VERSIÓN ULTRA-RÁPIDA
+# 🔄 SINCRONIZACIÓN OPORTUNIDADES - VERSIÓN OPTIMIZADA Y ESTABLE
 # ============================================================================
-# - 20 workers paralelos
-# - Sin barras de progreso molestas
-# - Output limpio
-# - Tiempo estimado: 3-4 minutos para 1500+ registros
+# - 12 workers paralelos (balance velocidad/estabilidad)
+# - Manejo robusto de errores y timeouts
+# - Output limpio sin barras molestas
 # ============================================================================
 
 import os
@@ -20,6 +19,7 @@ from sqlalchemy.types import CLOB, Integer, String, Float, Numeric
 from colorama import Fore, Style, init
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
+import threading
 
 init(autoreset=True)
 
@@ -33,27 +33,26 @@ FECHA_FILTRO = fecha_corte.isoformat()
 
 TABLE_ID = "OPORTUNIDADES_REAL"
 
-# CREDENCIALES DESDE VARIABLES DE ENTORNO (GitHub Secrets)
+# CREDENCIALES DESDE VARIABLES DE ENTORNO
 API_TOKEN = os.environ.get('CLIENTIFY_API_TOKEN')
 ORACLE_USER = os.environ.get('ORACLE_USER')
 ORACLE_PASSWORD = os.environ.get('ORACLE_PASSWORD')
 ORACLE_DSN = os.environ.get('ORACLE_DSN')
 
-# Validación de credenciales
 if not all([API_TOKEN, ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN]):
-    raise ValueError("❌ Faltan variables de entorno. Verifica los Secrets en GitHub.")
+    raise ValueError("❌ Faltan variables de entorno")
 
-# Session global con configuraciones de velocidad
+# Session global con configuraciones optimizadas
 session = requests.Session()
 session.headers.update({
     "Authorization": f"Token {API_TOKEN}", 
     "Content-Type": "application/json"
 })
 
-# Optimización de conexión HTTP - Connection Pooling
+# Configuración moderada de connection pooling
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=100,
-    pool_maxsize=100,
+    pool_connections=20,  # Reducido de 100 a 20
+    pool_maxsize=20,      # Reducido de 100 a 20
     max_retries=3,
     pool_block=False
 )
@@ -64,7 +63,7 @@ URL_OPORTUNIDADES = "https://api.clientify.net/v1/deals/"
 engine_oracle = create_engine(f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}@{ORACLE_DSN}")
 
 # ============================================================================
-# MAPA DE COLUMNAS Y TIPOS
+# MAPA DE COLUMNAS
 # ============================================================================
 
 MAPA_COLUMNAS_TIPOS = {
@@ -118,37 +117,41 @@ MAPA_COLUMNAS_TIPOS = {
 # ============================================================================
 
 def request_blindado(url):
-    """
-    Hace un request con reintentos automáticos y timeout agresivo
-    """
-    max_retries = 2
+    """Request con manejo robusto de errores"""
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            r = session.get(url, timeout=8)
+            r = session.get(url, timeout=12)  # Aumentado a 12 segundos
             
             if r.status_code == 200:
                 return r.json()
-            elif r.status_code == 429:  # Rate limit
-                time.sleep(1)
+            elif r.status_code == 429:
+                time.sleep(2)
                 continue
-            elif r.status_code >= 500:  # Error del servidor
-                time.sleep(1)
+            elif r.status_code >= 500:
+                time.sleep(2)
                 continue
             else:
                 return None
                 
-        except Exception as e:
-            if attempt == max_retries - 1:
-                return None
-            time.sleep(0.5)
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return None
+        except requests.exceptions.RequestException:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return None
+        except Exception:
+            return None
     
     return None
 
 
 def obtener_estimacion():
-    """
-    Calcula cuántos registros hay que procesar
-    """
+    """Calcula cuántos registros hay que procesar"""
     url = f"{URL_OPORTUNIDADES}?modified[gte]={FECHA_FILTRO}&page=1"
     data = request_blindado(url)
     
@@ -162,9 +165,7 @@ def obtener_estimacion():
 
 
 def obtener_datos_secuencial(total_paginas):
-    """
-    Descarga todas las páginas de listado (solo IDs básicos)
-    """
+    """Descarga todas las páginas de listado"""
     items_acumulados = []
     
     for page in range(1, total_paginas + 1):
@@ -178,68 +179,92 @@ def obtener_datos_secuencial(total_paginas):
         if page % 10 == 0 or page == total_paginas:
             sys.stdout.write(f"   → {page}/{total_paginas} páginas\r")
             sys.stdout.flush()
+        
+        # Pequeño delay para evitar sobrecarga
+        time.sleep(0.1)
     
     sys.stdout.write("\n")
     return items_acumulados
 
 
 def obtener_detalle_paralelo(item_id):
-    """
-    Obtiene el detalle completo de una oportunidad específica
-    (Esta función se ejecuta en paralelo)
-    """
+    """Obtiene el detalle de una oportunidad"""
     url = f"{URL_OPORTUNIDADES}{item_id}/"
     return request_blindado(url)
 
 
 def obtener_detalles(lista_items):
     """
-    Obtiene todos los detalles en paralelo usando ThreadPoolExecutor
+    Obtiene detalles en paralelo con 12 workers
+    Incluye manejo robusto de errores y timeouts
     """
     detalles_fin = []
+    errores = []
     total_items = len(lista_items)
-    contador = [0]  # Lista mutable para usar en closure
     
-    def callback(future):
-        """Callback que se ejecuta cuando cada future termina"""
-        detalle = future.result()
-        if detalle:
-            detalles_fin.append(detalle)
-        
-        contador[0] += 1
-        
-        # Mostrar progreso cada 50 items
-        if contador[0] % 50 == 0 or contador[0] == total_items:
-            sys.stdout.write(f"   → {contador[0]}/{total_items} detalles\r")
-            sys.stdout.flush()
+    # Lock para thread-safe
+    lock = threading.Lock()
+    contador = [0]
     
-    # Ejecutar en paralelo con 20 workers
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = []
+    def procesar_item(item):
+        """Procesa un item individual"""
+        try:
+            detalle = obtener_detalle_paralelo(item['id'])
+            
+            with lock:
+                contador[0] += 1
+                current = contador[0]
+                
+                if detalle:
+                    detalles_fin.append(detalle)
+                else:
+                    errores.append(item['id'])
+                
+                # Mostrar progreso cada 50 items
+                if current % 50 == 0 or current == total_items:
+                    sys.stdout.write(f"   → {current}/{total_items} detalles ({len(errores)} errores)\r")
+                    sys.stdout.flush()
+            
+            return detalle
+            
+        except Exception as e:
+            with lock:
+                errores.append(item['id'])
+            return None
+    
+    # Ejecutar en paralelo con 12 workers
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        # Submit todas las tareas
+        future_to_item = {
+            executor.submit(procesar_item, item): item 
+            for item in lista_items
+        }
         
-        for item in lista_items:
-            future = executor.submit(obtener_detalle_paralelo, item['id'])
-            future.add_done_callback(callback)
-            futures.append(future)
-        
-        # Esperar a que todos terminen
-        for future in futures:
-            future.result()
+        # Esperar resultados con timeout global de 30 minutos
+        try:
+            for future in as_completed(future_to_item, timeout=1800):
+                try:
+                    future.result(timeout=15)  # Timeout individual de 15 segundos
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"\n⚠️  Timeout global o error: {e}")
     
     sys.stdout.write("\n")
+    
+    if errores:
+        print(f"{Fore.YELLOW}   ⚠️  {len(errores)} detalles fallaron (continuando con los exitosos)")
+    
     return detalles_fin
 
 
 def procesar_datos(lista_datos):
-    """
-    Procesa y limpia los datos para que sean compatibles con Oracle
-    """
+    """Procesa y limpia los datos"""
     df = pd.DataFrame(lista_datos)
     
     if df.empty:
         return df
 
-    # Asegurar que existan todas las columnas necesarias
     cols_db = list(MAPA_COLUMNAS_TIPOS.keys())
     for col in cols_db:
         if col not in df.columns:
@@ -247,21 +272,17 @@ def procesar_datos(lista_datos):
     
     df = df[cols_db]
 
-    # Función para limpiar valores
     def _limpiar(val):
         if val is None:
             return None
         
-        # Convertir numpy arrays a listas
         if isinstance(val, np.ndarray):
             val = val.tolist()
         
-        # Verificar NaN solo en tipos escalares
         if isinstance(val, (int, float, str, bool)):
             if pd.isna(val):
                 return None
         
-        # Convertir listas y dicts a JSON
         if isinstance(val, (list, dict)):
             try:
                 return json.dumps(val, ensure_ascii=False)
@@ -270,26 +291,20 @@ def procesar_datos(lista_datos):
         
         return str(val)
 
-    # Aplicar tipos de datos según el mapa
     for col, tipo in MAPA_COLUMNAS_TIPOS.items():
         if isinstance(tipo, (String, CLOB)):
             df[col] = df[col].apply(_limpiar)
         elif isinstance(tipo, (Integer, Numeric, Float)):
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # Convertir nombres de columnas a mayúsculas (Oracle estándar)
     df.columns = [c.upper() for c in df.columns]
-
-    # Eliminar duplicados (quedarse con el más reciente por ID)
     df = df.drop_duplicates(subset=['ID'], keep='last')
 
     return df
 
 
 def ejecutar_merge_oracle(df, engine, table_name):
-    """
-    Ejecuta un MERGE (UPSERT) en Oracle usando tabla temporal
-    """
+    """Ejecuta MERGE en Oracle"""
     if df.empty:
         return
 
@@ -298,14 +313,12 @@ def ejecutar_merge_oracle(df, engine, table_name):
 
     try:
         with engine.connect() as conn:
-            # 1. Eliminar tabla temporal si existe
             try:
                 conn.execute(text(f'DROP TABLE "{temp_table}"'))
                 conn.commit()
             except:
                 pass
 
-            # 2. Subir datos a tabla temporal
             df.to_sql(
                 temp_table,
                 con=engine,
@@ -316,13 +329,8 @@ def ejecutar_merge_oracle(df, engine, table_name):
                 chunksize=1000
             )
 
-            # 3. Construir query MERGE dinámico
             cols = df.columns.tolist()
-            
-            # Columnas para UPDATE (todas menos ID)
             set_clause = ", ".join([f'T."{c}"=S."{c}"' for c in cols if c != 'ID'])
-            
-            # Columnas para INSERT
             ins_cols = ", ".join([f'"{c}"' for c in cols])
             ins_vals = ", ".join([f'S."{c}"' for c in cols])
 
@@ -336,11 +344,9 @@ def ejecutar_merge_oracle(df, engine, table_name):
                 INSERT ({ins_cols}) VALUES ({ins_vals})
             """
 
-            # 4. Ejecutar MERGE
             conn.execute(text(sql_merge))
             conn.commit()
 
-            # 5. Limpiar tabla temporal
             conn.execute(text(f'DROP TABLE "{temp_table}"'))
             conn.commit()
 
@@ -355,34 +361,31 @@ def ejecutar_merge_oracle(df, engine, table_name):
 # ============================================================================
 
 def main():
-    """
-    Función principal que coordina todo el proceso
-    """
+    """Función principal"""
     inicio = time.time()
     
-    # ========== HEADER ==========
     print(f"\n{Fore.CYAN}{'='*80}")
-    print(f"{Fore.MAGENTA}🚀 SINCRONIZACIÓN OPORTUNIDADES - MODO ULTRA-RÁPIDO")
+    print(f"{Fore.MAGENTA}🚀 SINCRONIZACIÓN OPORTUNIDADES - VERSIÓN ESTABLE")
     print(f"{Fore.CYAN}{'='*80}")
     print(f"{Fore.WHITE}📅 Fecha corte: {FECHA_FILTRO}")
-    print(f"{Fore.WHITE}🎯 Tabla destino: {TABLE_ID}")
-    print(f"{Fore.WHITE}⚡ Workers paralelos: 20")
+    print(f"{Fore.WHITE}🎯 Tabla: {TABLE_ID}")
+    print(f"{Fore.WHITE}⚡ Workers: 12 (optimizado para estabilidad)")
     print(f"{Fore.CYAN}{'='*80}\n")
 
-    # ========== 1. ESTIMACIÓN ==========
-    print(f"{Fore.YELLOW}⏳ Calculando cambios desde hace {DIAS_ATRAS} día(s)...")
+    # 1. Estimación
+    print(f"{Fore.YELLOW}⏳ Calculando cambios...")
     total, page_size = obtener_estimacion()
     
     if total == 0:
-        print(f"{Fore.GREEN}✅ No hay cambios. Todo está actualizado.\n")
+        print(f"{Fore.GREEN}✅ No hay cambios\n")
         return
 
     total_paginas = math.ceil(total / page_size)
-    print(f"{Fore.WHITE}   ✓ Cambios detectados: {total} registros")
-    print(f"{Fore.WHITE}   ✓ Páginas a descargar: {total_paginas}\n")
+    print(f"{Fore.WHITE}   ✓ Detectados: {total} registros")
+    print(f"{Fore.WHITE}   ✓ Páginas: {total_paginas}\n")
 
-    # ========== 2. DESCARGA DE PÁGINAS ==========
-    print(f"{Fore.YELLOW}📥 Descargando páginas (listado básico)...")
+    # 2. Descarga páginas
+    print(f"{Fore.YELLOW}📥 Descargando páginas...")
     items = obtener_datos_secuencial(total_paginas)
     
     if not items:
@@ -391,48 +394,35 @@ def main():
     
     print(f"{Fore.GREEN}   ✓ {len(items)} oportunidades encontradas\n")
 
-    # ========== 3. OBTENER DETALLES (PARALELO) ==========
-    print(f"{Fore.YELLOW}🔍 Obteniendo detalles completos (20 workers paralelos)...")
+    # 3. Obtener detalles
+    print(f"{Fore.YELLOW}🔍 Obteniendo detalles (12 workers paralelos)...")
     detalles = obtener_detalles(items)
-    print(f"{Fore.GREEN}   ✓ {len(detalles)} detalles obtenidos correctamente\n")
+    print(f"{Fore.GREEN}   ✓ {len(detalles)} detalles obtenidos\n")
 
-    # ========== 4. PROCESAR Y SINCRONIZAR ==========
+    # 4. Procesar y sincronizar
     try:
-        print(f"{Fore.YELLOW}⚙️  Procesando y limpiando datos...")
+        print(f"{Fore.YELLOW}⚙️  Procesando datos...")
         df_final = procesar_datos(detalles)
         print(f"{Fore.GREEN}   ✓ {len(df_final)} registros procesados\n")
         
-        print(f"{Fore.YELLOW}🔄 Sincronizando con Oracle Database...")
-        print(f"   → Creando tabla temporal...")
-        print(f"   → Subiendo {len(df_final)} registros...")
-        print(f"   → Ejecutando MERGE (UPDATE + INSERT)...")
-        
+        print(f"{Fore.YELLOW}🔄 Sincronizando con Oracle...")
         ejecutar_merge_oracle(df_final, engine_oracle, TABLE_ID)
+        print(f"{Fore.GREEN}   ✓ MERGE completado\n")
         
-        print(f"{Fore.GREEN}   ✓ MERGE completado exitosamente\n")
-        
-        # ========== ÉXITO ==========
         print(f"{Fore.GREEN}{'='*80}")
         print(f"{Fore.GREEN}✅ SINCRONIZACIÓN EXITOSA")
         print(f"{Fore.GREEN}{'='*80}\n")
         
     except Exception as e:
-        # ========== ERROR ==========
         print(f"\n{Fore.RED}{'='*80}")
-        print(f"{Fore.RED}❌ ERROR CRÍTICO")
-        print(f"{Fore.RED}{'='*80}")
-        print(f"{Fore.RED}{str(e)}\n")
+        print(f"{Fore.RED}❌ ERROR: {e}")
+        print(f"{Fore.RED}{'='*80}\n")
         raise
 
-    # ========== TIEMPO TOTAL ==========
     mins, secs = divmod(time.time() - inicio, 60)
-    print(f"{Fore.CYAN}⏱️  Tiempo total de ejecución: {int(mins)}m {int(secs)}s")
+    print(f"{Fore.CYAN}⏱️  Tiempo total: {int(mins)}m {int(secs)}s")
     print(f"{Fore.CYAN}{'='*80}\n")
 
-
-# ============================================================================
-# PUNTO DE ENTRADA
-# ============================================================================
 
 if __name__ == "__main__":
     main()
