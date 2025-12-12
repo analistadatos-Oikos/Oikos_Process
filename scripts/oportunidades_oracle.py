@@ -1,9 +1,9 @@
 # ============================================================================
-# 🔄 SINCRONIZACIÓN OPORTUNIDADES - VERSIÓN OPTIMIZADA Y ESTABLE
+# 🔄 SINCRONIZACIÓN OPORTUNIDADES - VERSIÓN CONSERVADORA (5 WORKERS)
 # ============================================================================
-# - 12 workers paralelos (balance velocidad/estabilidad)
-# - Manejo robusto de errores y timeouts
-# - Output limpio sin barras molestas
+# - 5 workers paralelos (máxima estabilidad)
+# - Timeouts agresivos para evitar bloqueos
+# - Skip automático de requests problemáticos
 # ============================================================================
 
 import os
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import CLOB, Integer, String, Float, Numeric
 from colorama import Fore, Style, init
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import sys
 import threading
 
@@ -33,7 +33,7 @@ FECHA_FILTRO = fecha_corte.isoformat()
 
 TABLE_ID = "OPORTUNIDADES_REAL"
 
-# CREDENCIALES DESDE VARIABLES DE ENTORNO
+# CREDENCIALES
 API_TOKEN = os.environ.get('CLIENTIFY_API_TOKEN')
 ORACLE_USER = os.environ.get('ORACLE_USER')
 ORACLE_PASSWORD = os.environ.get('ORACLE_PASSWORD')
@@ -42,18 +42,18 @@ ORACLE_DSN = os.environ.get('ORACLE_DSN')
 if not all([API_TOKEN, ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN]):
     raise ValueError("❌ Faltan variables de entorno")
 
-# Session global con configuraciones optimizadas
+# Session global
 session = requests.Session()
 session.headers.update({
     "Authorization": f"Token {API_TOKEN}", 
     "Content-Type": "application/json"
 })
 
-# Configuración moderada de connection pooling
+# Connection pooling conservador
 adapter = requests.adapters.HTTPAdapter(
-    pool_connections=20,  # Reducido de 100 a 20
-    pool_maxsize=20,      # Reducido de 100 a 20
-    max_retries=3,
+    pool_connections=10,
+    pool_maxsize=10,
+    max_retries=2,
     pool_block=False
 )
 session.mount('http://', adapter)
@@ -116,33 +116,28 @@ MAPA_COLUMNAS_TIPOS = {
 # FUNCIONES
 # ============================================================================
 
-def request_blindado(url):
-    """Request con manejo robusto de errores"""
-    max_retries = 3
+def request_blindado(url, timeout=10):
+    """Request con timeout agresivo y pocos reintentos"""
+    max_retries = 2  # Solo 2 intentos
+    
     for attempt in range(max_retries):
         try:
-            r = session.get(url, timeout=12)  # Aumentado a 12 segundos
+            r = session.get(url, timeout=timeout)
             
             if r.status_code == 200:
                 return r.json()
             elif r.status_code == 429:
-                time.sleep(2)
-                continue
+                time.sleep(1)
             elif r.status_code >= 500:
-                time.sleep(2)
-                continue
+                time.sleep(1)
             else:
                 return None
                 
         except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
+            # Si hay timeout, salir rápido
             return None
         except requests.exceptions.RequestException:
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
+            # Cualquier error de red, salir rápido
             return None
         except Exception:
             return None
@@ -165,101 +160,115 @@ def obtener_estimacion():
 
 
 def obtener_datos_secuencial(total_paginas):
-    """Descarga todas las páginas de listado"""
+    """Descarga páginas secuencialmente"""
     items_acumulados = []
     
     for page in range(1, total_paginas + 1):
         url = f"{URL_OPORTUNIDADES}?modified[gte]={FECHA_FILTRO}&page={page}"
-        data = request_blindado(url)
+        data = request_blindado(url, timeout=10)
         
         if data:
             items_acumulados.extend(data.get("results", []))
         
-        # Mostrar progreso cada 10 páginas
         if page % 10 == 0 or page == total_paginas:
             sys.stdout.write(f"   → {page}/{total_paginas} páginas\r")
             sys.stdout.flush()
         
-        # Pequeño delay para evitar sobrecarga
-        time.sleep(0.1)
+        time.sleep(0.15)  # Delay para evitar sobrecarga
     
     sys.stdout.write("\n")
     return items_acumulados
 
 
 def obtener_detalle_paralelo(item_id):
-    """Obtiene el detalle de una oportunidad"""
+    """Obtiene detalle con timeout corto"""
     url = f"{URL_OPORTUNIDADES}{item_id}/"
-    return request_blindado(url)
+    return request_blindado(url, timeout=8)  # Timeout corto de 8 segundos
 
 
 def obtener_detalles(lista_items):
     """
-    Obtiene detalles en paralelo con 12 workers
-    Incluye manejo robusto de errores y timeouts
+    Obtiene detalles con SOLO 5 WORKERS
+    Timeout agresivo para evitar bloqueos
     """
     detalles_fin = []
     errores = []
+    skipped = []
     total_items = len(lista_items)
     
-    # Lock para thread-safe
     lock = threading.Lock()
     contador = [0]
     
-    def procesar_item(item):
-        """Procesa un item individual"""
-        try:
-            detalle = obtener_detalle_paralelo(item['id'])
-            
-            with lock:
-                contador[0] += 1
-                current = contador[0]
-                
-                if detalle:
-                    detalles_fin.append(detalle)
-                else:
-                    errores.append(item['id'])
-                
-                # Mostrar progreso cada 50 items
-                if current % 50 == 0 or current == total_items:
-                    sys.stdout.write(f"   → {current}/{total_items} detalles ({len(errores)} errores)\r")
-                    sys.stdout.flush()
-            
-            return detalle
-            
-        except Exception as e:
-            with lock:
-                errores.append(item['id'])
-            return None
+    print(f"   🔄 Iniciando descarga con 5 workers...")
+    print(f"   ⏱️  Timeout por request: 8 segundos")
+    print(f"   🔄 Si un request se congela, se skipea automáticamente\n")
     
-    # Ejecutar en paralelo con 12 workers
-    with ThreadPoolExecutor(max_workers=12) as executor:
-        # Submit todas las tareas
-        future_to_item = {
-            executor.submit(procesar_item, item): item 
-            for item in lista_items
-        }
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Enviar todas las tareas
+        future_to_id = {}
+        for item in lista_items:
+            future = executor.submit(obtener_detalle_paralelo, item['id'])
+            future_to_id[future] = item['id']
         
-        # Esperar resultados con timeout global de 30 minutos
-        try:
-            for future in as_completed(future_to_item, timeout=1800):
-                try:
-                    future.result(timeout=15)  # Timeout individual de 15 segundos
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"\n⚠️  Timeout global o error: {e}")
+        # Procesar resultados con timeout individual
+        for future in as_completed(future_to_id, timeout=3600):  # 1 hora total
+            item_id = future_to_id[future]
+            
+            try:
+                # Timeout de 10 segundos para obtener resultado
+                detalle = future.result(timeout=10)
+                
+                with lock:
+                    contador[0] += 1
+                    current = contador[0]
+                    
+                    if detalle:
+                        detalles_fin.append(detalle)
+                    else:
+                        errores.append(item_id)
+                    
+                    # Mostrar progreso cada 25 items
+                    if current % 25 == 0 or current == total_items:
+                        sys.stdout.write(
+                            f"   → {current}/{total_items} | "
+                            f"✓ {len(detalles_fin)} OK | "
+                            f"✗ {len(errores)} errores | "
+                            f"⏭ {len(skipped)} skipped\r"
+                        )
+                        sys.stdout.flush()
+                
+            except TimeoutError:
+                # Si este request individual se congela, skipear
+                with lock:
+                    skipped.append(item_id)
+                    contador[0] += 1
+                    current = contador[0]
+                    
+                    if current % 25 == 0 or current == total_items:
+                        sys.stdout.write(
+                            f"   → {current}/{total_items} | "
+                            f"✓ {len(detalles_fin)} OK | "
+                            f"✗ {len(errores)} errores | "
+                            f"⏭ {len(skipped)} skipped\r"
+                        )
+                        sys.stdout.flush()
+                
+            except Exception as e:
+                with lock:
+                    errores.append(item_id)
+                    contador[0] += 1
     
     sys.stdout.write("\n")
     
-    if errores:
-        print(f"{Fore.YELLOW}   ⚠️  {len(errores)} detalles fallaron (continuando con los exitosos)")
+    if errores or skipped:
+        total_fallidos = len(errores) + len(skipped)
+        print(f"{Fore.YELLOW}   ⚠️  {total_fallidos} requests fallaron (continuando con {len(detalles_fin)} exitosos)")
     
     return detalles_fin
 
 
 def procesar_datos(lista_datos):
-    """Procesa y limpia los datos"""
+    """Procesa datos"""
     df = pd.DataFrame(lista_datos)
     
     if df.empty:
@@ -304,7 +313,7 @@ def procesar_datos(lista_datos):
 
 
 def ejecutar_merge_oracle(df, engine, table_name):
-    """Ejecuta MERGE en Oracle"""
+    """Ejecuta MERGE"""
     if df.empty:
         return
 
@@ -351,8 +360,7 @@ def ejecutar_merge_oracle(df, engine, table_name):
             conn.commit()
 
     except Exception as e:
-        sys.stdout.write(f"\n{Fore.RED}❌ Error en Merge: {e}\n")
-        sys.stdout.flush()
+        sys.stdout.write(f"\n{Fore.RED}❌ Error: {e}\n")
         raise
 
 
@@ -365,11 +373,11 @@ def main():
     inicio = time.time()
     
     print(f"\n{Fore.CYAN}{'='*80}")
-    print(f"{Fore.MAGENTA}🚀 SINCRONIZACIÓN OPORTUNIDADES - VERSIÓN ESTABLE")
+    print(f"{Fore.MAGENTA}🚀 SINCRONIZACIÓN OPORTUNIDADES - VERSIÓN CONSERVADORA")
     print(f"{Fore.CYAN}{'='*80}")
     print(f"{Fore.WHITE}📅 Fecha corte: {FECHA_FILTRO}")
     print(f"{Fore.WHITE}🎯 Tabla: {TABLE_ID}")
-    print(f"{Fore.WHITE}⚡ Workers: 12 (optimizado para estabilidad)")
+    print(f"{Fore.WHITE}⚡ Workers: 5 (máxima estabilidad)")
     print(f"{Fore.CYAN}{'='*80}\n")
 
     # 1. Estimación
@@ -394,12 +402,16 @@ def main():
     
     print(f"{Fore.GREEN}   ✓ {len(items)} oportunidades encontradas\n")
 
-    # 3. Obtener detalles
-    print(f"{Fore.YELLOW}🔍 Obteniendo detalles (12 workers paralelos)...")
+    # 3. Obtener detalles (5 WORKERS)
+    print(f"{Fore.YELLOW}🔍 Obteniendo detalles (5 workers - modo estable)...")
     detalles = obtener_detalles(items)
     print(f"{Fore.GREEN}   ✓ {len(detalles)} detalles obtenidos\n")
 
-    # 4. Procesar y sincronizar
+    # 4. Procesar
+    if len(detalles) == 0:
+        print(f"{Fore.RED}❌ No se obtuvieron detalles. Abortando.\n")
+        return
+    
     try:
         print(f"{Fore.YELLOW}⚙️  Procesando datos...")
         df_final = procesar_datos(detalles)
