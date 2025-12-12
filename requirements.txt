@@ -5,3 +5,5 @@ sqlalchemy==2.0.25
 oracledb==2.0.1
 numpy==1.26.3
 colorama==0.4.6
+pyarrow==15.0.0
+oci==2.119.1
