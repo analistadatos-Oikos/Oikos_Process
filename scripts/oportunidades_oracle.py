@@ -1,5 +1,5 @@
 # ============================================================================
-# 🔄 BLOQUE MERGE: OPTIMIZADO CON PARALELIZACIÓN (8 WORKERS)
+# 🔄 BLOQUE MERGE: OPTIMIZADO CON PARALELIZACIÓN (8 WORKERS) - OUTPUT LIMPIO
 # ============================================================================
 
 import os
@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.types import CLOB, Integer, String, Float, Numeric
 from colorama import Fore, Style, init
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
 
 init(autoreset=True)
 
@@ -100,16 +101,25 @@ def obtener_datos_secuencial(total_paginas):
     """Descarga todas las páginas de listado (IDs)"""
     items_acumulados = []
     
-    with tqdm(total=total_paginas, desc="📥 Descargando páginas", 
-              unit="pag", colour='cyan', ncols=80, leave=False) as pbar:
-        for page in range(1, total_paginas + 1):
-            url = f"{URL_OPORTUNIDADES}?modified[gte]={FECHA_FILTRO}&page={page}"
-            data = request_blindado(url)
-            if data:
-                items_acumulados.extend(data.get("results", []))
-            time.sleep(0.05)
-            pbar.update(1)
+    # Barra con file=sys.stdout y bar_format personalizado
+    pbar = tqdm(
+        total=total_paginas,
+        desc="📥 Descargando páginas",
+        unit="pag",
+        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+        file=sys.stdout,
+        dynamic_ncols=True
+    )
     
+    for page in range(1, total_paginas + 1):
+        url = f"{URL_OPORTUNIDADES}?modified[gte]={FECHA_FILTRO}&page={page}"
+        data = request_blindado(url)
+        if data:
+            items_acumulados.extend(data.get("results", []))
+        time.sleep(0.05)
+        pbar.update(1)
+    
+    pbar.close()
     return items_acumulados
 
 def obtener_detalle_paralelo(item_id):
@@ -122,21 +132,29 @@ def obtener_detalles(lista_items):
     detalles_fin = []
     total_items = len(lista_items)
     
-    with tqdm(total=total_items, desc="🔍 Obteniendo detalles", 
-              unit="deal", colour='green', ncols=80, leave=False) as pbar:
-        
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            # Enviar todas las tareas
-            futures = {executor.submit(obtener_detalle_paralelo, item['id']): item 
-                      for item in lista_items}
-            
-            # Procesar conforme van terminando
-            for future in as_completed(futures):
-                detalle = future.result()
-                if detalle:
-                    detalles_fin.append(detalle)
-                pbar.update(1)
+    # Barra con configuración para evitar múltiples líneas
+    pbar = tqdm(
+        total=total_items,
+        desc="🔍 Obteniendo detalles",
+        unit="deal",
+        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+        file=sys.stdout,
+        dynamic_ncols=True
+    )
     
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        # Enviar todas las tareas
+        futures = {executor.submit(obtener_detalle_paralelo, item['id']): item 
+                  for item in lista_items}
+        
+        # Procesar conforme van terminando
+        for future in as_completed(futures):
+            detalle = future.result()
+            if detalle:
+                detalles_fin.append(detalle)
+            pbar.update(1)
+    
+    pbar.close()
     return detalles_fin
 
 def procesar_datos(lista_datos):
@@ -195,8 +213,10 @@ def ejecutar_merge_oracle(df, engine, table_name):
             except:
                 pass
 
-            # 2. Subir datos a tabla temporal
-            print(f"   📤 Subiendo {len(df)} registros a Oracle...")
+            # 2. Subir datos a tabla temporal (sin print, solo write directo)
+            sys.stdout.write(f"   📤 Subiendo {len(df)} registros a Oracle...\n")
+            sys.stdout.flush()
+            
             df.to_sql(temp_table, con=engine, if_exists='replace', index=False, 
                      dtype=dtype, method='multi', chunksize=1000)
 
@@ -217,7 +237,9 @@ def ejecutar_merge_oracle(df, engine, table_name):
             """
 
             # 4. Ejecutar MERGE
-            print(f"   🔄 Ejecutando MERGE...")
+            sys.stdout.write(f"   🔄 Ejecutando MERGE...\n")
+            sys.stdout.flush()
+            
             conn.execute(text(sql_merge))
             conn.commit()
 
@@ -226,7 +248,8 @@ def ejecutar_merge_oracle(df, engine, table_name):
             conn.commit()
 
     except Exception as e:
-        print(f"{Fore.RED}❌ Error en Merge: {e}")
+        sys.stdout.write(f"\n{Fore.RED}❌ Error en Merge: {e}\n")
+        sys.stdout.flush()
         raise
 
 # ============================================================================
@@ -236,58 +259,74 @@ def ejecutar_merge_oracle(df, engine, table_name):
 def main():
     inicio = time.time()
     
-    print(f"\n{Fore.CYAN}{'='*80}")
-    print(f"{Fore.MAGENTA}🚀 SINCRONIZACIÓN INCREMENTAL - OPORTUNIDADES (OPTIMIZADO)")
-    print(f"{Fore.CYAN}{'='*80}")
-    print(f"{Fore.WHITE}📅 Fecha corte: {FECHA_FILTRO}")
-    print(f"{Fore.WHITE}🎯 Tabla destino: {TABLE_ID}")
-    print(f"{Fore.CYAN}{'='*80}\n")
+    # Header sin usar print múltiple
+    sys.stdout.write(f"\n{Fore.CYAN}{'='*80}\n")
+    sys.stdout.write(f"{Fore.MAGENTA}🚀 SINCRONIZACIÓN INCREMENTAL - OPORTUNIDADES (OPTIMIZADO)\n")
+    sys.stdout.write(f"{Fore.CYAN}{'='*80}\n")
+    sys.stdout.write(f"{Fore.WHITE}📅 Fecha corte: {FECHA_FILTRO}\n")
+    sys.stdout.write(f"{Fore.WHITE}🎯 Tabla destino: {TABLE_ID}\n")
+    sys.stdout.write(f"{Fore.CYAN}{'='*80}\n\n")
+    sys.stdout.flush()
 
     # 1. Estimación
-    print(f"{Fore.YELLOW}⏳ Calculando cambios...")
+    sys.stdout.write(f"{Fore.YELLOW}⏳ Calculando cambios...\n")
+    sys.stdout.flush()
+    
     total, page_size = obtener_estimacion()
     
     if total == 0:
-        print(f"{Fore.GREEN}✅ No hay cambios. Todo está actualizado.\n")
+        sys.stdout.write(f"{Fore.GREEN}✅ No hay cambios. Todo está actualizado.\n\n")
+        sys.stdout.flush()
         return
 
     total_paginas = math.ceil(total / page_size)
-    print(f"{Fore.WHITE}   ✓ Cambios detectados: {total}")
-    print(f"{Fore.WHITE}   ✓ Páginas a procesar: {total_paginas}\n")
+    sys.stdout.write(f"{Fore.WHITE}   ✓ Cambios detectados: {total}\n")
+    sys.stdout.write(f"{Fore.WHITE}   ✓ Páginas a procesar: {total_paginas}\n\n")
+    sys.stdout.flush()
 
     # 2. Descarga de IDs (listado)
     items = obtener_datos_secuencial(total_paginas)
     if not items:
-        print(f"{Fore.RED}❌ No se obtuvieron datos\n")
+        sys.stdout.write(f"{Fore.RED}❌ No se obtuvieron datos\n\n")
+        sys.stdout.flush()
         return
     
-    print(f"{Fore.GREEN}   ✓ {len(items)} oportunidades encontradas\n")
+    sys.stdout.write(f"{Fore.GREEN}   ✓ {len(items)} oportunidades encontradas\n\n")
+    sys.stdout.flush()
 
     # 3. Obtener detalles completos (PARALELO con 8 workers)
     detalles = obtener_detalles(items)
-    print(f"{Fore.GREEN}   ✓ {len(detalles)} detalles obtenidos\n")
+    sys.stdout.write(f"{Fore.GREEN}   ✓ {len(detalles)} detalles obtenidos\n\n")
+    sys.stdout.flush()
 
     # 4. Procesar y hacer MERGE
     try:
-        print(f"{Fore.YELLOW}⚙️  Procesando datos...\n")
+        sys.stdout.write(f"{Fore.YELLOW}⚙️  Procesando datos...\n\n")
+        sys.stdout.flush()
+        
         df_final = procesar_datos(detalles)
         
-        print(f"{Fore.YELLOW}🔄 Sincronizando con Oracle...\n")
+        sys.stdout.write(f"{Fore.YELLOW}🔄 Sincronizando con Oracle...\n\n")
+        sys.stdout.flush()
+        
         ejecutar_merge_oracle(df_final, engine_oracle, TABLE_ID)
         
-        print(f"\n{Fore.GREEN}{'='*80}")
-        print(f"{Fore.GREEN}✅ SINCRONIZACIÓN EXITOSA")
-        print(f"{Fore.GREEN}{'='*80}\n")
+        sys.stdout.write(f"\n{Fore.GREEN}{'='*80}\n")
+        sys.stdout.write(f"{Fore.GREEN}✅ SINCRONIZACIÓN EXITOSA\n")
+        sys.stdout.write(f"{Fore.GREEN}{'='*80}\n\n")
+        sys.stdout.flush()
         
     except Exception as e:
-        print(f"\n{Fore.RED}{'='*80}")
-        print(f"{Fore.RED}❌ ERROR CRÍTICO: {e}")
-        print(f"{Fore.RED}{'='*80}\n")
+        sys.stdout.write(f"\n{Fore.RED}{'='*80}\n")
+        sys.stdout.write(f"{Fore.RED}❌ ERROR CRÍTICO: {e}\n")
+        sys.stdout.write(f"{Fore.RED}{'='*80}\n\n")
+        sys.stdout.flush()
         raise
 
     # Tiempo total
     mins, secs = divmod(time.time() - inicio, 60)
-    print(f"{Fore.CYAN}⏱️  Tiempo total: {int(mins)}m {int(secs)}s\n")
+    sys.stdout.write(f"{Fore.CYAN}⏱️  Tiempo total: {int(mins)}m {int(secs)}s\n\n")
+    sys.stdout.flush()
 
 if __name__ == "__main__":
     main()
