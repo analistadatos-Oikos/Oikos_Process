@@ -1,5 +1,5 @@
 # ============================================================================
-# 🔄 BLOQUE MERGE: ACTUALIZACIÓN INCREMENTAL (ÚLTIMO DÍA)
+# 🔄 BLOQUE MERGE: OPTIMIZADO CON PARALELIZACIÓN (8 WORKERS)
 # ============================================================================
 
 import os
@@ -14,11 +14,11 @@ from tqdm import tqdm
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import CLOB, Integer, String, Float, Numeric
 from colorama import Fore, Style, init
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 init(autoreset=True)
 
 # --- CONFIGURACIÓN DINÁMICA ---
-# Calculamos la fecha de hace 1 día automáticamente
 DIAS_ATRAS = 1
 fecha_corte = datetime.now(timezone.utc) - timedelta(days=DIAS_ATRAS)
 FECHA_FILTRO = fecha_corte.isoformat()
@@ -35,7 +35,10 @@ ORACLE_DSN = os.environ.get('ORACLE_DSN')
 if not all([API_TOKEN, ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN]):
     raise ValueError("❌ Faltan variables de entorno. Verifica los Secrets en GitHub.")
 
-HEADERS = { "Authorization": f"Token {API_TOKEN}", "Content-Type": "application/json" }
+# Session global para reutilizar conexiones HTTP
+session = requests.Session()
+session.headers.update({"Authorization": f"Token {API_TOKEN}", "Content-Type": "application/json"})
+
 URL_OPORTUNIDADES = "https://api.clientify.net/v1/deals/"
 engine_oracle = create_engine(f"oracle+oracledb://{ORACLE_USER}:{ORACLE_PASSWORD}@{ORACLE_DSN}")
 
@@ -59,25 +62,31 @@ MAPA_COLUMNAS_TIPOS = {
 }
 
 # ============================================================================
-# 🧠 FUNCIONES
+# 🧠 FUNCIONES OPTIMIZADAS
 # ============================================================================
 
 def request_blindado(url):
-    while True:
+    """Request con reintentos y timeout reducido"""
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            if r.status_code == 200: return r.json()
+            r = session.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json()
             elif r.status_code == 429:
-                time.sleep(5)
-                continue
+                time.sleep(2)
             elif r.status_code >= 500:
-                time.sleep(5)
-                continue
-            else: return None
-        except: time.sleep(5)
+                time.sleep(2)
+            else:
+                return None
+        except:
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(1)
+    return None
 
 def obtener_estimacion():
-    print(f"{Fore.CYAN}ℹ️  Buscando cambios desde: {FECHA_FILTRO}...")
+    """Calcula cuántos registros hay que procesar"""
     url = f"{URL_OPORTUNIDADES}?modified[gte]={FECHA_FILTRO}&page=1"
     data = request_blindado(url)
     if data:
@@ -88,85 +97,112 @@ def obtener_estimacion():
     return 0, 50
 
 def obtener_datos_secuencial(total_paginas):
+    """Descarga todas las páginas de listado (IDs)"""
     items_acumulados = []
-    print(f"\n{Fore.WHITE}📥 Descargando {total_paginas} páginas de cambios...")
-    pbar = tqdm(range(1, total_paginas + 1), desc="Páginas", unit="pag", colour='cyan')
-    for page in pbar:
-        url = f"{URL_OPORTUNIDADES}?modified[gte]={FECHA_FILTRO}&page={page}"
-        data = request_blindado(url)
-        if data:
-            items_acumulados.extend(data.get("results", []))
-        time.sleep(0.2)
+    
+    with tqdm(total=total_paginas, desc="📥 Descargando páginas", 
+              unit="pag", colour='cyan', ncols=80, leave=False) as pbar:
+        for page in range(1, total_paginas + 1):
+            url = f"{URL_OPORTUNIDADES}?modified[gte]={FECHA_FILTRO}&page={page}"
+            data = request_blindado(url)
+            if data:
+                items_acumulados.extend(data.get("results", []))
+            time.sleep(0.05)
+            pbar.update(1)
+    
     return items_acumulados
 
+def obtener_detalle_paralelo(item_id):
+    """Obtiene el detalle completo de una oportunidad (para paralelizar)"""
+    url = f"{URL_OPORTUNIDADES}{item_id}/"
+    return request_blindado(url)
+
 def obtener_detalles(lista_items):
+    """Obtiene detalles en paralelo con 8 workers"""
     detalles_fin = []
-    print(f"\n{Fore.WHITE}🔍 Actualizando detalles profundos...")
-    pbar = tqdm(lista_items, desc="Detalles", unit="deal", colour='green')
-    for item in pbar:
-        url = f"{URL_OPORTUNIDADES}{item['id']}/"
-        detalle = request_blindado(url)
-        if detalle: detalles_fin.append(detalle)
-        time.sleep(0.1)
+    total_items = len(lista_items)
+    
+    with tqdm(total=total_items, desc="🔍 Obteniendo detalles", 
+              unit="deal", colour='green', ncols=80, leave=False) as pbar:
+        
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            # Enviar todas las tareas
+            futures = {executor.submit(obtener_detalle_paralelo, item['id']): item 
+                      for item in lista_items}
+            
+            # Procesar conforme van terminando
+            for future in as_completed(futures):
+                detalle = future.result()
+                if detalle:
+                    detalles_fin.append(detalle)
+                pbar.update(1)
+    
     return detalles_fin
 
 def procesar_datos(lista_datos):
-    print(f"\n{Fore.CYAN}⚙️  Procesando datos para MERGE...")
+    """Procesa y limpia los datos para Oracle"""
     df = pd.DataFrame(lista_datos)
-    if df.empty: return df
+    if df.empty:
+        return df
 
+    # Asegurar que existan todas las columnas
     cols_db = list(MAPA_COLUMNAS_TIPOS.keys())
     for col in cols_db:
-        if col not in df.columns: df[col] = None
+        if col not in df.columns:
+            df[col] = None
     df = df[cols_db]
 
+    # Función de limpieza
     def _limpiar(val):
-        if val is None: return None
+        if val is None or pd.isna(val):
+            return None
         if isinstance(val, (list, dict, np.ndarray)):
-            try: return json.dumps(val, ensure_ascii=False)
-            except: return "[]"
-        if pd.isna(val): return None
+            try:
+                return json.dumps(val, ensure_ascii=False)
+            except:
+                return "[]"
         return str(val)
 
+    # Aplicar tipos de datos
     for col, tipo in MAPA_COLUMNAS_TIPOS.items():
         if isinstance(tipo, (String, CLOB)):
             df[col] = df[col].apply(_limpiar)
         elif isinstance(tipo, (Integer, Numeric, Float)):
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
+    # Columnas en mayúsculas
     df.columns = [c.upper() for c in df.columns]
 
-    # --- DEDUPLICACIÓN (IMPORTANTE PARA MERGE) ---
-    # Para el MERGE, el ID debe ser único en el paquete que subimos.
-    # Si un ID aparece dos veces el último Día, nos quedamos con el más reciente.
+    # Deduplicar por ID (quedarse con el más reciente)
     df = df.drop_duplicates(subset=['ID'], keep='last')
 
     return df
 
 def ejecutar_merge_oracle(df, engine, table_name):
-    if df.empty: return
+    """Ejecuta MERGE (UPSERT) en Oracle"""
+    if df.empty:
+        return
 
     temp_table = f"{table_name}_TEMP"
-    print(f"\n{Fore.YELLOW}🔄 EJECUTANDO MERGE (UPSERT) EN ORACLE...")
-    print(f"   » Registros a procesar: {len(df)}")
-
     dtype = {k.upper(): v for k, v in MAPA_COLUMNAS_TIPOS.items()}
 
     try:
         with engine.connect() as conn:
-            # 1. Crear/Limpiar Tabla Temporal
-            try: conn.execute(text(f'DROP TABLE "{temp_table}"')); conn.commit()
-            except: pass
+            # 1. Limpiar tabla temporal si existe
+            try:
+                conn.execute(text(f'DROP TABLE "{temp_table}"'))
+                conn.commit()
+            except:
+                pass
 
-            # 2. Subir datos a Temporal
-            print(f"{Fore.CYAN}   » Subiendo a tabla temporal...")
-            df.to_sql(temp_table, con=engine, if_exists='replace', index=False, dtype=dtype)
+            # 2. Subir datos a tabla temporal
+            print(f"   📤 Subiendo {len(df)} registros a Oracle...")
+            df.to_sql(temp_table, con=engine, if_exists='replace', index=False, 
+                     dtype=dtype, method='multi', chunksize=1000)
 
-            # 3. Construir Query MERGE Dinámico
+            # 3. Construir query MERGE
             cols = df.columns.tolist()
-            # Clause SET (Para Updates): Actualiza todo menos el ID
             set_clause = ", ".join([f'T."{c}"=S."{c}"' for c in cols if c != 'ID'])
-            # Clause INSERT (Para Nuevos): Inserta todo
             ins_cols = ", ".join([f'"{c}"' for c in cols])
             ins_vals = ", ".join([f'S."{c}"' for c in cols])
 
@@ -181,7 +217,7 @@ def ejecutar_merge_oracle(df, engine, table_name):
             """
 
             # 4. Ejecutar MERGE
-            print(f"{Fore.MAGENTA}   » Cruzando datos (Update/Insert)...")
+            print(f"   🔄 Ejecutando MERGE...")
             conn.execute(text(sql_merge))
             conn.commit()
 
@@ -189,46 +225,69 @@ def ejecutar_merge_oracle(df, engine, table_name):
             conn.execute(text(f'DROP TABLE "{temp_table}"'))
             conn.commit()
 
-        print(f"{Fore.GREEN}✅ ¡SINCRONIZACIÓN EXITOSA! Datos actualizados.")
-
     except Exception as e:
-        print(f"{Fore.RED}❌ Error en el Merge: {e}")
+        print(f"{Fore.RED}❌ Error en Merge: {e}")
         raise
 
 # ============================================================================
-# 🚀 EJECUCIÓN
+# 🚀 EJECUCIÓN PRINCIPAL
 # ============================================================================
 
 def main():
     inicio = time.time()
-    print(f"{Fore.MAGENTA}{Style.BRIGHT}🚀 INICIO PROCESO INCREMENTAL (MERGE 3 DÍAS)")
+    
+    print(f"\n{Fore.CYAN}{'='*80}")
+    print(f"{Fore.MAGENTA}🚀 SINCRONIZACIÓN INCREMENTAL - OPORTUNIDADES (OPTIMIZADO)")
+    print(f"{Fore.CYAN}{'='*80}")
+    print(f"{Fore.WHITE}📅 Fecha corte: {FECHA_FILTRO}")
+    print(f"{Fore.WHITE}🎯 Tabla destino: {TABLE_ID}")
+    print(f"{Fore.CYAN}{'='*80}\n")
 
     # 1. Estimación
+    print(f"{Fore.YELLOW}⏳ Calculando cambios...")
     total, page_size = obtener_estimacion()
+    
     if total == 0:
-        print(f"{Fore.GREEN}✅ No hay cambios Todo al día.")
+        print(f"{Fore.GREEN}✅ No hay cambios. Todo está actualizado.\n")
         return
 
     total_paginas = math.ceil(total / page_size)
-    print(f"   » Cambios detectados: {total}")
+    print(f"{Fore.WHITE}   ✓ Cambios detectados: {total}")
+    print(f"{Fore.WHITE}   ✓ Páginas a procesar: {total_paginas}\n")
 
-    # 2. Descarga
+    # 2. Descarga de IDs (listado)
     items = obtener_datos_secuencial(total_paginas)
-    if not items: return
+    if not items:
+        print(f"{Fore.RED}❌ No se obtuvieron datos\n")
+        return
+    
+    print(f"{Fore.GREEN}   ✓ {len(items)} oportunidades encontradas\n")
 
-    # 3. Detalles
+    # 3. Obtener detalles completos (PARALELO con 8 workers)
     detalles = obtener_detalles(items)
+    print(f"{Fore.GREEN}   ✓ {len(detalles)} detalles obtenidos\n")
 
-    # 4. Procesar y Merge
+    # 4. Procesar y hacer MERGE
     try:
+        print(f"{Fore.YELLOW}⚙️  Procesando datos...\n")
         df_final = procesar_datos(detalles)
+        
+        print(f"{Fore.YELLOW}🔄 Sincronizando con Oracle...\n")
         ejecutar_merge_oracle(df_final, engine_oracle, TABLE_ID)
+        
+        print(f"\n{Fore.GREEN}{'='*80}")
+        print(f"{Fore.GREEN}✅ SINCRONIZACIÓN EXITOSA")
+        print(f"{Fore.GREEN}{'='*80}\n")
+        
     except Exception as e:
-        print(f"Error crítico: {e}")
+        print(f"\n{Fore.RED}{'='*80}")
+        print(f"{Fore.RED}❌ ERROR CRÍTICO: {e}")
+        print(f"{Fore.RED}{'='*80}\n")
         raise
 
+    # Tiempo total
     mins, secs = divmod(time.time() - inicio, 60)
-    print(f"\n{Fore.WHITE}⏱️ TIEMPO TOTAL: {int(mins)}m {int(secs)}s")
+    print(f"{Fore.CYAN}⏱️  Tiempo total: {int(mins)}m {int(secs)}s\n")
 
 if __name__ == "__main__":
     main()
