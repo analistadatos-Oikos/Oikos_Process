@@ -1,0 +1,7 @@
+requests==2.31.0
+pandas==2.2.0
+tqdm==4.66.1
+sqlalchemy==2.0.25
+oracledb==2.0.1
+numpy==1.26.3
+colorama==0.4.6
